@@ -12,6 +12,20 @@ document.addEventListener('DOMContentLoaded', () => {
         }
     });
 
+    // Reset Counter Button
+    const resetBtn = document.getElementById('reset-btn');
+    if (resetBtn) {
+        resetBtn.addEventListener('click', () => {
+            chrome.runtime.sendMessage({ action: 'RESET_COUNTER' }, (res) => {
+                if (res && res.status === 'reset') {
+                     const original = resetBtn.innerHTML;
+                     resetBtn.innerHTML = '<span style="font-size:10px;color:#40c057">OK</span>';
+                     setTimeout(() => resetBtn.innerHTML = original, 1000);
+                }
+            });
+        });
+    }
+
     // Listen for Progress Updates
     chrome.runtime.onMessage.addListener((message) => {
         if (message.action === 'DOWNLOAD_PROGRESS') {

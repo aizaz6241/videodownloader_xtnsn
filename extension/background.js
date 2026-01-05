@@ -75,7 +75,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
                 if (seenUrls.has(v.url)) return;
                 seenUrls.add(v.url);
 
-                // Title dedup: If we already have a video with this title, assume duplicates/variants
+                // Title dedup
                 if (v.pageTitle && v.pageTitle !== 'video') {
                      if (seenTitles.has(v.pageTitle)) return;
                      seenTitles.add(v.pageTitle);
@@ -83,7 +83,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
                 unique.push(v); 
             });
 
-            // Enrich with Duration/Thumb
+            // Enrich with Duration/Thumb (Newest First)
             Promise.all(unique.map(enrichVideo)).then(final => sendResponse({ videos: final.reverse() }));
         });
         return true;
@@ -113,6 +113,15 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
             chrome.notifications.create({ type: 'basic', iconUrl: 'icons/icon48.png', title: 'Failed', message: err.message });
         });
         return false;
+    }
+
+    // E. Reset Counter
+    if (msg.action === 'RESET_COUNTER') {
+        chrome.storage.local.set({ serialCounter: 1 }, () => {
+             console.log('[DEBUG] Serial Counter Reset to 1');
+             sendResponse({ status: 'reset', value: 1 });
+        });
+        return true;
     }
 });
 
@@ -169,7 +178,6 @@ function sendToNative(message) {
 async function handleDownload(video) {
     // 0. Force Metadata correction (Fix filename issue)
     if (!video.pageTitle || video.pageTitle === 'video') {
-        // Fallback search
         for (let [tabId, list] of detectedMedia) {
              const found = list.find(v => v.url === video.url);
              if (found && found.pageTitle) {
@@ -179,6 +187,8 @@ async function handleDownload(video) {
         }
     }
 
+    // 1. Prepare Filename
+    let finalName = 'video.mp4';
     if (video.pageTitle && video.pageTitle.trim().length > 0) {
          let ext = 'mp4';
          if (video.filename && video.filename.includes('.')) {
@@ -189,12 +199,18 @@ async function handleDownload(video) {
          // Strict Sanitization
          let safe = video.pageTitle.replace(/&/g, 'and');
          safe = safe.replace(/[<>:"/\\|?*\x00-\x1F]/g, "_").replace(/\s+/g, '_').trim();
-         
-         video.filename = `${safe}.${ext}`;
-         console.log(`[DEBUG] Final Filename set to: ${video.filename}`);
-    } else {
-        console.warn('[DEBUG] No pageTitle available for filename generation.');
+         finalName = `${safe}.${ext}`;
     }
+
+    // 2. Apply Serial Number
+    const data = await chrome.storage.local.get(['serialCounter']);
+    let counter = data.serialCounter || 1;
+    
+    video.filename = `${counter}- ${finalName}`; // Apply prefix
+    console.log(`[DEBUG] Final Filename with Serial: ${video.filename}`);
+
+    // Increment and Save
+    await chrome.storage.local.set({ serialCounter: counter + 1 });
 
     // Try Native First
     try {
