@@ -18,9 +18,9 @@ document.addEventListener('DOMContentLoaded', () => {
         resetBtn.addEventListener('click', () => {
             chrome.runtime.sendMessage({ action: 'RESET_COUNTER' }, (res) => {
                 if (res && res.status === 'reset') {
-                     const original = resetBtn.innerHTML;
-                     resetBtn.innerHTML = '<span style="font-size:10px;color:#40c057">OK</span>';
-                     setTimeout(() => resetBtn.innerHTML = original, 1000);
+                    const original = resetBtn.innerHTML;
+                    resetBtn.innerHTML = '<span style="font-size:10px;color:#40c057">OK</span>';
+                    setTimeout(() => resetBtn.innerHTML = original, 1000);
                 }
             });
         });
@@ -91,6 +91,12 @@ document.addEventListener('DOMContentLoaded', () => {
             // Duration Logic
             const durationStr = formatDuration(video.duration);
 
+            // Downloaded Status
+            let statusHtml = '';
+            if (video.downloaded) {
+                statusHtml = '<span class="status-tag" style="background:#40c057;color:white;padding:2px 6px;border-radius:4px;font-size:10px;margin-left:5px;">Downloaded</span>';
+            }
+
             li.innerHTML = `
         <div class="card-top">
             <div class="thumbnail">
@@ -102,6 +108,7 @@ document.addEventListener('DOMContentLoaded', () => {
                 <div>
                     <div class="title-row">
                         <span class="badge ${video.type}">${typeLabel}</span>
+                        ${statusHtml}
                         <div class="video-title" title="${video.url}">${video.pageTitle || video.filename || 'Untitled Video'}</div>
                     </div>
                     <div class="extension-tag">${video.filename || 'video.mp4'} • ${sizeStr}</div>

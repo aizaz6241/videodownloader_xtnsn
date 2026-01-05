@@ -3,7 +3,9 @@ import { detectMediaType, extractMetadata, MediaTypes } from './mediaDetector.js
 // --- STATE MANAGEMENT ---
 const detectedMedia = new Map(); // tabId -> [Video]
 const activeDownloads = new Map(); // url -> { cancelled: boolean }
+const completedDownloads = new Set(); // url
 const downloadBlobs = new Map(); // downloadId -> blobUrl
+const downloadOriginalUrls = new Map(); // downloadId -> originalUrl
 const filenameOverrides = new Map(); // Strict Filename Map
 
 // --- BADGE ---
@@ -49,6 +51,7 @@ chrome.webRequest.onHeadersReceived.addListener((details) => {
                 metadata.pageTitle = tab.title;
                 metadata.pageUrl = tab.url; // Referer
                 metadata.tabId = details.tabId;
+                metadata.timestamp = Date.now(); // ADDED: Timestamp
                 list.push(metadata);
                 updateBadge(details.tabId);
             });
@@ -65,22 +68,25 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
             if (!tab) return sendResponse({ videos: [] });
 
             let stored = detectedMedia.get(tab.id) || [];
-            
+
             // DEDUPLICATION LOGIC
             const unique = [];
             const seenUrls = new Set();
-            const seenTitles = new Set();
-            
-            stored.forEach(v => { 
+            const seenTitles = new Map(); // Title -> Timestamp
+
+            stored.forEach(v => {
                 if (seenUrls.has(v.url)) return;
                 seenUrls.add(v.url);
 
-                // Title dedup
+                // Smart Deduplication
                 if (v.pageTitle && v.pageTitle !== 'video') {
-                     if (seenTitles.has(v.pageTitle)) return;
-                     seenTitles.add(v.pageTitle);
+                    const lastSeen = seenTitles.get(v.pageTitle);
+                    // If seen within last 15 seconds, ignore
+                    if (lastSeen && (v.timestamp - lastSeen < 15000)) return;
+
+                    seenTitles.set(v.pageTitle, v.timestamp);
                 }
-                unique.push(v); 
+                unique.push(v);
             });
 
             // Enrich with Duration/Thumb (Newest First)
@@ -118,8 +124,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     // E. Reset Counter
     if (msg.action === 'RESET_COUNTER') {
         chrome.storage.local.set({ serialCounter: 1 }, () => {
-             console.log('[DEBUG] Serial Counter Reset to 1');
-             sendResponse({ status: 'reset', value: 1 });
+            console.log('[DEBUG] Serial Counter Reset to 1');
+            sendResponse({ status: 'reset', value: 1 });
         });
         return true;
     }
@@ -143,7 +149,13 @@ async function enrichVideo(video) {
                     if (crop?.status === 'success') thumb = crop.url;
                 } catch (e) { }
             }
-            resolve({ ...video, duration: meta.duration || video.duration, thumbnail: thumb, pageTitle: video.pageTitle || meta.pageTitle });
+            resolve({
+                ...video,
+                duration: meta.duration || video.duration,
+                thumbnail: thumb,
+                pageTitle: video.pageTitle || meta.pageTitle,
+                downloaded: completedDownloads.has(video.url)
+            });
         });
     });
     return Promise.race([fetchMeta, timeout]);
@@ -179,33 +191,33 @@ async function handleDownload(video) {
     // 0. Force Metadata correction (Fix filename issue)
     if (!video.pageTitle || video.pageTitle === 'video') {
         for (let [tabId, list] of detectedMedia) {
-             const found = list.find(v => v.url === video.url);
-             if (found && found.pageTitle) {
-                 video.pageTitle = found.pageTitle;
-                 break;
-             }
+            const found = list.find(v => v.url === video.url);
+            if (found && found.pageTitle) {
+                video.pageTitle = found.pageTitle;
+                break;
+            }
         }
     }
 
     // 1. Prepare Filename
     let finalName = 'video.mp4';
     if (video.pageTitle && video.pageTitle.trim().length > 0) {
-         let ext = 'mp4';
-         if (video.filename && video.filename.includes('.')) {
-             ext = video.filename.split('.').pop();
-             if (ext.length > 4 || ext.includes('/')) ext = 'mp4';
-         }
-         
-         // Strict Sanitization
-         let safe = video.pageTitle.replace(/&/g, 'and');
-         safe = safe.replace(/[<>:"/\\|?*\x00-\x1F]/g, "_").replace(/\s+/g, '_').trim();
-         finalName = `${safe}.${ext}`;
+        let ext = 'mp4';
+        if (video.filename && video.filename.includes('.')) {
+            ext = video.filename.split('.').pop();
+            if (ext.length > 4 || ext.includes('/')) ext = 'mp4';
+        }
+
+        // Strict Sanitization
+        let safe = video.pageTitle.replace(/&/g, 'and');
+        safe = safe.replace(/[<>:"/\\|?*\x00-\x1F]/g, "_").replace(/\s+/g, '_').trim();
+        finalName = `${safe}.${ext}`;
     }
 
     // 2. Apply Serial Number
     const data = await chrome.storage.local.get(['serialCounter']);
     let counter = data.serialCounter || 1;
-    
+
     video.filename = `${counter}- ${finalName}`; // Apply prefix
     console.log(`[DEBUG] Final Filename with Serial: ${video.filename}`);
 
@@ -245,12 +257,12 @@ async function handleDownload(video) {
     }
 
     if (video.type === MediaTypes.HLS) return downloadHLS(video);
-    
+
     // Direct Download
     const safeTitle = (video.pageTitle || video.filename || 'video').replace(/[<>:"/\\|?*\x00-\x1F]/g, "_").trim();
     const ext = video.filename.split('.').pop();
     const targetName = `${safeTitle}.${ext}`;
-    triggerDownload(video.url, targetName, false);
+    triggerDownload(video.url, targetName, false, video.url);
 }
 
 // --- HLS ENGINE (LEGACY JS FALLBACK) ---
@@ -315,7 +327,7 @@ async function downloadHLS(video) {
         const parser = new HLSParser(video.url, text);
         const segments = parser.getSegments();
         const totalDuration = parser.getTotalDuration();
-        
+
         if (!segments.length) throw new Error("No segments found");
 
         // 5. Download Loop
@@ -338,8 +350,8 @@ async function downloadHLS(video) {
             const buf = await res.arrayBuffer();
             if (buf.byteLength === 0) throw new Error("Empty segment");
             if (buf.byteLength < 1000) {
-                 const start = String.fromCharCode(...new Uint8Array(buf.slice(0, 50))).toLowerCase();
-                 if (start.includes('<!doc') || start.includes('<html')) throw new Error("HTML response");
+                const start = String.fromCharCode(...new Uint8Array(buf.slice(0, 50))).toLowerCase();
+                if (start.includes('<!doc') || start.includes('<html')) throw new Error("HTML response");
             }
             chunks[index] = buf;
             return buf.byteLength;
@@ -368,42 +380,42 @@ async function downloadHLS(video) {
 
         // 6. Transmuxing using IDB to bypass 64MB limit
         console.log('[DEBUG] STEP 6: Sending to Transmuxer...');
-        
+
         const chunkKeys = [];
         await setupOffscreen();
-        
+
         const saveChunk = (chunk, idx) => {
-             return new Promise((resolve, reject) => {
-                 const key = `chunk_${session}_${Date.now()}_${idx}`;
-                 const req = indexedDB.open('DownloadDB', 2);
-                 req.onupgradeneeded = (e) => {
-                      const db = e.target.result;
-                      if (!db.objectStoreNames.contains('blobs')) {
-                           db.createObjectStore('blobs');
-                      }
-                 };
-                 req.onsuccess = (e) => {
-                     const tx = e.target.result.transaction('blobs', 'readwrite');
-                     tx.objectStore('blobs').put(new Blob([chunk]), key);
-                     tx.oncomplete = () => {  e.target.result.close(); resolve(key); };
-                     tx.onerror = () => reject(tx.error);
-                 };
-                 req.onerror = () => reject(req.error);
-             });
+            return new Promise((resolve, reject) => {
+                const key = `chunk_${session}_${Date.now()}_${idx}`;
+                const req = indexedDB.open('DownloadDB', 2);
+                req.onupgradeneeded = (e) => {
+                    const db = e.target.result;
+                    if (!db.objectStoreNames.contains('blobs')) {
+                        db.createObjectStore('blobs');
+                    }
+                };
+                req.onsuccess = (e) => {
+                    const tx = e.target.result.transaction('blobs', 'readwrite');
+                    tx.objectStore('blobs').put(new Blob([chunk]), key);
+                    tx.oncomplete = () => { e.target.result.close(); resolve(key); };
+                    tx.onerror = () => reject(tx.error);
+                };
+                req.onerror = () => reject(req.error);
+            });
         };
 
         for (let i = 0; i < chunks.length; i++) {
-             if (chunks[i]) chunkKeys.push(await saveChunk(chunks[i], i));
+            if (chunks[i]) chunkKeys.push(await saveChunk(chunks[i], i));
         }
 
         // Filename
         let finalExt = '.mp4';
         let targetName = video.filename;
         if (!targetName || targetName.endsWith('.ts') || targetName.startsWith('http')) {
-             const safeTitle = (video.pageTitle || 'video').replace(/[<>:"/\\|?*\x00-\x1F]/g, "_").trim();
-             targetName = safeTitle + finalExt;
+            const safeTitle = (video.pageTitle || 'video').replace(/[<>:"/\\|?*\x00-\x1F]/g, "_").trim();
+            targetName = safeTitle + finalExt;
         } else if (!targetName.endsWith(finalExt)) {
-             targetName += finalExt;
+            targetName += finalExt;
         }
 
         try {
@@ -417,14 +429,14 @@ async function downloadHLS(video) {
             if (res?.status === 'success') {
                 console.log('[DEBUG] Transmux Successful!');
                 const urlRes = await chrome.runtime.sendMessage({ action: 'createUrlFromIDB', blobKey: res.blobKey });
-                triggerDownload(urlRes.url, targetName, true);
+                triggerDownload(urlRes.url, targetName, true, video.url);
                 setTimeout(() => chrome.runtime.sendMessage({ action: 'deleteBlob', key: res.blobKey }), 60000);
             } else {
                 throw new Error("Transmux failed");
             }
         } catch (e) {
             console.error(e);
-            throw e; 
+            throw e;
         }
 
     } catch (err) {
@@ -450,19 +462,23 @@ function notifyProgress(url, percent, speed, status = 'Downloading') {
     chrome.runtime.sendMessage({ action: 'DOWNLOAD_PROGRESS', url, percent, speed, status }).catch(() => { });
 }
 
-function triggerDownload(url, filename, isBlob) {
+function triggerDownload(url, filename, isBlob, originalUrl = null) {
     console.log(`[DEBUG] triggerDownload called. URL: ${url}, Filename: ${filename}`);
     filenameOverrides.set(url, filename);
     chrome.downloads.download({ url: url, saveAs: false }, (dId) => {
         if (chrome.runtime.lastError) {
-             console.error("[DEBUG] Download failed to start:", chrome.runtime.lastError);
-             filenameOverrides.delete(url);
+            console.error("[DEBUG] Download failed to start:", chrome.runtime.lastError);
+            filenameOverrides.delete(url);
         } else {
-             if (isBlob && dId) {
+            if (originalUrl) {
+                downloadOriginalUrls.set(dId, originalUrl);
+            }
+            if (isBlob && dId) {
                 downloadBlobs.set(dId, url);
                 setTimeout(() => {
                     URL.revokeObjectURL(url);
                     chrome.runtime.sendMessage({ action: 'revokeBlobUrl', url });
+                    downloadOriginalUrls.delete(dId); // Clean up
                 }, 900000);
             }
         }
@@ -492,5 +508,19 @@ class HLSParser {
         }
         return total > 0 ? total : 0;
     }
-    getVariants() { return []; } 
+    getVariants() { return []; }
 }
+
+// --- TRACK DOWNLOADS ---
+chrome.downloads.onChanged.addListener((delta) => {
+    if (delta.state && delta.state.current === 'complete') {
+        chrome.downloads.search({ id: delta.id }, (items) => {
+            if (items && items[0]) {
+                const url = items[0].url;
+                // Check if this was one of our blob downloads or tracked original
+                const originalUrl = downloadOriginalUrls.get(delta.id) || downloadBlobs.get(delta.id) || url;
+                completedDownloads.add(originalUrl);
+            }
+        });
+    }
+});
