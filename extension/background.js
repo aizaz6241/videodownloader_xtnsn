@@ -4,6 +4,7 @@ import { detectMediaType, extractMetadata, MediaTypes } from './mediaDetector.js
 const detectedMedia = new Map(); // tabId -> [Video]
 const activeDownloads = new Map(); // url -> { cancelled: boolean }
 const downloadBlobs = new Map(); // downloadId -> blobUrl
+const filenameOverrides = new Map(); // Strict Filename Map
 
 // --- BADGE ---
 function updateBadge(tabId) {
@@ -31,6 +32,7 @@ chrome.webRequest.onHeadersReceived.addListener((details) => {
         if (!detectedMedia.has(details.tabId)) detectedMedia.set(details.tabId, []);
         const list = detectedMedia.get(details.tabId);
 
+        // Dedup by URL
         if (!list.find(v => v.url === details.url)) {
             chrome.tabs.get(details.tabId, (tab) => {
                 if (chrome.runtime.lastError) return;
@@ -63,10 +65,23 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
             if (!tab) return sendResponse({ videos: [] });
 
             let stored = detectedMedia.get(tab.id) || [];
-            // Dedup
+            
+            // DEDUPLICATION LOGIC
             const unique = [];
-            const seen = new Set();
-            stored.forEach(v => { if (!seen.has(v.url)) { seen.add(v.url); unique.push(v); } });
+            const seenUrls = new Set();
+            const seenTitles = new Set();
+            
+            stored.forEach(v => { 
+                if (seenUrls.has(v.url)) return;
+                seenUrls.add(v.url);
+
+                // Title dedup: If we already have a video with this title, assume duplicates/variants
+                if (v.pageTitle && v.pageTitle !== 'video') {
+                     if (seenTitles.has(v.pageTitle)) return;
+                     seenTitles.add(v.pageTitle);
+                }
+                unique.push(v); 
+            });
 
             // Enrich with Duration/Thumb
             Promise.all(unique.map(enrichVideo)).then(final => sendResponse({ videos: final }));
@@ -104,7 +119,6 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 // --- ENRICHMENT LOGIC ---
 async function enrichVideo(video) {
     if (!video.tabId) return video;
-    // Timeout for metadata fetch
     const timeout = new Promise(r => setTimeout(() => r(video), 1200));
 
     const fetchMeta = new Promise(resolve => {
@@ -113,7 +127,6 @@ async function enrichVideo(video) {
 
             let thumb = video.thumbnail || meta.thumbnail;
             if (!thumb && meta.captureRect) {
-                // Try capture
                 try {
                     const ss = await chrome.tabs.captureVisibleTab(null, { format: 'jpeg', quality: 50 });
                     await setupOffscreen();
@@ -155,30 +168,30 @@ function sendToNative(message) {
 // --- DOWNLOAD HANDLER ---
 async function handleDownload(video) {
     // 0. Force Metadata correction (Fix filename issue)
-    // Fallback: If pageTitle is missing, try to find it in memory
     if (!video.pageTitle || video.pageTitle === 'video') {
+        // Fallback search
         for (let [tabId, list] of detectedMedia) {
-            const found = list.find(v => v.url === video.url);
-            if (found && found.pageTitle) {
-                video.pageTitle = found.pageTitle;
-                break;
-            }
+             const found = list.find(v => v.url === video.url);
+             if (found && found.pageTitle) {
+                 video.pageTitle = found.pageTitle;
+                 break;
+             }
         }
     }
 
     if (video.pageTitle && video.pageTitle.trim().length > 0) {
-        // Preserve extension if it exists, default to mp4
-        let ext = 'mp4';
-        if (video.filename && video.filename.includes('.')) {
-            ext = video.filename.split('.').pop();
-            if (ext.length > 4 || ext.includes('/')) ext = 'mp4';
-        }
-        // Sanitize (Replace & with 'and', remove bad chars, spaces to underscores)
-        let safe = video.pageTitle.replace(/&/g, 'and');
-        safe = safe.replace(/[<>:"/\\|?*\x00-\x1F]/g, "_").replace(/\s+/g, '_').trim();
-
-        video.filename = `${safe}.${ext}`;
-        console.log(`[DEBUG] Final Filename set to: ${video.filename}`);
+         let ext = 'mp4';
+         if (video.filename && video.filename.includes('.')) {
+             ext = video.filename.split('.').pop();
+             if (ext.length > 4 || ext.includes('/')) ext = 'mp4';
+         }
+         
+         // Strict Sanitization
+         let safe = video.pageTitle.replace(/&/g, 'and');
+         safe = safe.replace(/[<>:"/\\|?*\x00-\x1F]/g, "_").replace(/\s+/g, '_').trim();
+         
+         video.filename = `${safe}.${ext}`;
+         console.log(`[DEBUG] Final Filename set to: ${video.filename}`);
     } else {
         console.warn('[DEBUG] No pageTitle available for filename generation.');
     }
@@ -204,8 +217,6 @@ async function handleDownload(video) {
         return;
     } catch (e) {
         console.warn('[DEBUG] Native Host failed/missing:', e);
-        // Fallback to JS if needed, but user specifically wants to fix "Not Working" by using the right tools.
-        // If native fails, we should modify the error message to tell them to install it.
         if (e.message && e.message.includes("NativeMessagingHosts")) {
             chrome.notifications.create({
                 type: 'basic',
@@ -218,18 +229,17 @@ async function handleDownload(video) {
     }
 
     if (video.type === MediaTypes.HLS) return downloadHLS(video);
-    // Direct
+    
+    // Direct Download
     const safeTitle = (video.pageTitle || video.filename || 'video').replace(/[<>:"/\\|?*\x00-\x1F]/g, "_").trim();
     const ext = video.filename.split('.').pop();
     const targetName = `${safeTitle}.${ext}`;
-    chrome.downloads.download({ url: video.url, filename: `downloads/${targetName}`, saveAs: false });
+    triggerDownload(video.url, targetName, false);
 }
 
 // --- HLS ENGINE (LEGACY JS FALLBACK) ---
 async function downloadHLS(video) {
-    // Keep existing implementation as fallback, but warn user
     console.log('[DEBUG] Fallback to JS HLS download...', video.url);
-    // ... (rest of the existing function logic if needed, or simply warn)
 
     chrome.notifications.create({
         type: 'basic',
@@ -250,7 +260,6 @@ async function downloadHLS(video) {
         console.log('[DEBUG] STEP 1: Fetching Manifest...');
         let response = await fetch(video.url);
         let text = await response.text();
-        console.log(`[DEBUG] Manifest Received. Length: ${text.length}`);
 
         // 2. Select Best Stream if Master
         if (text.includes('#EXT-X-STREAM-INF')) {
@@ -261,11 +270,7 @@ async function downloadHLS(video) {
                 if (lines[i].includes('BANDWIDTH')) {
                     const bwMatch = lines[i].match(/BANDWIDTH=(\d+)/);
                     const bw = bwMatch ? parseInt(bwMatch[1]) : 0;
-                    const resMatch = lines[i].match(/RESOLUTION=(\d+x\d+)/);
                     const currentUrl = lines[i + 1]?.trim();
-
-                    console.log(`[DEBUG] Variant Found: BW=${bw}, RES=${resMatch ? resMatch[1] : 'N/A'}, URL=${currentUrl}`);
-
                     if (parseInt(bw) > maxH) {
                         maxH = parseInt(bw);
                         bestUrl = currentUrl;
@@ -273,22 +278,18 @@ async function downloadHLS(video) {
                 }
             }
             if (bestUrl) {
-                console.log(`[DEBUG] Selected Best Variant: ${bestUrl} (Bandwidth: ${maxH})`);
                 if (!bestUrl.startsWith('http')) {
                     const base = video.url.substring(0, video.url.lastIndexOf('/') + 1);
                     bestUrl = base + bestUrl;
                 }
                 console.log(`[DEBUG] Fetching Variant Manifest: ${bestUrl}`);
                 text = await fetch(bestUrl).then(r => r.text());
-                video.url = bestUrl; // Update target
-            } else {
-                console.warn('[DEBUG] No valid variants found in master?');
+                video.url = bestUrl;
             }
         }
 
         // 3. DRM Check
         if (text.includes('#EXT-X-KEY')) {
-            console.error('[DEBUG] DRM DETECTED!');
             throw new Error("DRM Protected");
         }
 
@@ -297,55 +298,43 @@ async function downloadHLS(video) {
         const parser = new HLSParser(video.url, text);
         const segments = parser.getSegments();
         const totalDuration = parser.getTotalDuration();
-        console.log(`[DEBUG] Segments Found: ${segments.length}, Duration: ${totalDuration}`);
-
+        
         if (!segments.length) throw new Error("No segments found");
 
-        // 5. Download Loop (Concurrent & Robust)
+        // 5. Download Loop
         console.log('[DEBUG] STEP 5: Starting Download Loop...');
         const chunks = new Array(segments.length);
         let downloaded = 0;
         let totalBytes = 0;
         const startTime = Date.now();
 
-        // Helper: Fetch with retry
         const downloadSegment = async (url, index) => {
             if (activeDownloads.get(id).cancelled) throw new Error("Cancelled");
-            // console.log(`[DEBUG] Fetching Seg ${index}: ${url}`);
-
             let res;
             try {
                 res = await fetch(url.startsWith('http') ? url : new URL(url, video.url).href, { referrer: video.pageUrl });
                 if (!res.ok) throw new Error(res.status);
             } catch (e) {
-                // Retry strict mode off
                 res = await fetch(url, { credentials: 'omit', referrerPolicy: 'no-referrer' });
             }
             if (!res.ok) throw new Error("Fetch failed");
-
             const buf = await res.arrayBuffer();
             if (buf.byteLength === 0) throw new Error("Empty segment");
-
-            // HTML Guard
             if (buf.byteLength < 1000) {
-                const start = String.fromCharCode(...new Uint8Array(buf.slice(0, 50))).toLowerCase();
-                if (start.includes('<!doc') || start.includes('<html')) throw new Error("HTML response");
+                 const start = String.fromCharCode(...new Uint8Array(buf.slice(0, 50))).toLowerCase();
+                 if (start.includes('<!doc') || start.includes('<html')) throw new Error("HTML response");
             }
-
             chunks[index] = buf;
             return buf.byteLength;
         };
 
-        // Execution: Batch processing (Simulated Concurrency 3)
+        // Execution
         for (let i = 0; i < segments.length; i++) {
             if (activeDownloads.get(id).cancelled) break;
             try {
                 const size = await downloadSegment(segments[i], i);
                 totalBytes += size;
                 downloaded++;
-                console.log(`[DEBUG] Seg ${i} Downloaded. Size: ${size}`);
-
-                // Progress
                 const pct = Math.round((downloaded / segments.length) * 100);
                 if (pct % 5 === 0 || i === segments.length - 1) {
                     const speed = Math.round((totalBytes / 1024) / ((Date.now() - startTime) / 1000));
@@ -353,82 +342,72 @@ async function downloadHLS(video) {
                     safeUpdateBadge(`${pct}%`, tabId);
                 }
             } catch (e) {
-                console.warn(`[DEBUG] Seg ${i} FAILED`, e); // Skip bad segments? Or Fail?
-                // Fallback: If minimal failure, skip. video might skip.
+                console.warn(`[DEBUG] Seg ${i} FAILED`, e);
             }
         }
-
-        console.log(`[DEBUG] Download Loop Finished. Downloaded: ${downloaded}/${segments.length}. Total Bytes: ${totalBytes}`);
 
         if (downloaded === 0) throw new Error("Download failed");
-
         notifyProgress(id, 100, 'Processing...');
 
-        // 6. Transmuxing
+        // 6. Transmuxing using IDB to bypass 64MB limit
         console.log('[DEBUG] STEP 6: Sending to Transmuxer...');
+        
+        const chunkKeys = [];
         await setupOffscreen();
+        
+        const saveChunk = (chunk, idx) => {
+             return new Promise((resolve, reject) => {
+                 const key = `chunk_${Date.now()}_${idx}`;
+                 const req = indexedDB.open('DownloadDB', 2);
+                 req.onupgradeneeded = (e) => {
+                      const db = e.target.result;
+                      if (!db.objectStoreNames.contains('blobs')) {
+                           db.createObjectStore('blobs');
+                      }
+                 };
+                 req.onsuccess = (e) => {
+                     const tx = e.target.result.transaction('blobs', 'readwrite');
+                     tx.objectStore('blobs').put(new Blob([chunk]), key);
+                     tx.oncomplete = () => {  e.target.result.close(); resolve(key); };
+                     tx.onerror = () => reject(tx.error);
+                 };
+                 req.onerror = () => reject(req.error);
+             });
+        };
 
-        // Sanity Check: TS vs fMP4?
-        const isTS = (new Uint8Array(chunks[0])[0] === 0x47);
-        console.log(`[DEBUG] First Byte: ${new Uint8Array(chunks[0])[0]} (MPEG-TS=71)`);
-
-        let finalExt = isTS ? '.mp4' : '.mp4';
-
-        const base64Chunks = chunks.filter(c => c).map(c => {
-            // Manual binary string build (fastest for large arrays in chrome ext?)
-            // Or use FileReader? ArrayBuffer -> Base64 is tricky.
-            // Using standard approach
-            let bin = '';
-            const bytes = new Uint8Array(c);
-            const len = bytes.byteLength;
-            // Chunking string build to avoid stack overflow
-            for (let j = 0; j < len; j += 32768) {
-                bin += String.fromCharCode(...bytes.subarray(j, j + 32768));
-            }
-            return btoa(bin);
-        });
-
-        // Use the filename prepared in handleDownload if available
-        let targetName = video.filename;
-        if (!targetName || targetName.endsWith('.ts') || targetName.startsWith('http')) {
-            const safeTitle = (video.pageTitle || 'video').replace(/[<>:"/\\|?*\x00-\x1F]/g, "_").trim();
-            targetName = safeTitle + finalExt;
-        } else if (!targetName.endsWith(finalExt)) {
-            targetName += finalExt;
+        for (let i = 0; i < chunks.length; i++) {
+             if (chunks[i]) chunkKeys.push(await saveChunk(chunks[i], i));
         }
 
-        console.log(`[DEBUG] Target Filename for Chrome: ${targetName}`);
+        // Filename
+        let finalExt = '.mp4';
+        let targetName = video.filename;
+        if (!targetName || targetName.endsWith('.ts') || targetName.startsWith('http')) {
+             const safeTitle = (video.pageTitle || 'video').replace(/[<>:"/\\|?*\x00-\x1F]/g, "_").trim();
+             targetName = safeTitle + finalExt;
+        } else if (!targetName.endsWith(finalExt)) {
+             targetName += finalExt;
+        }
 
         try {
-            // Try Transmux
             const res = await chrome.runtime.sendMessage({
                 action: 'transmux',
-                base64Chunks: base64Chunks,
+                chunkKeys: chunkKeys, // Keys only!
                 mimeType: 'video/mp4',
                 duration: totalDuration
             });
 
             if (res?.status === 'success') {
-                console.log('[DEBUG] Transmux Successful!', res.debug);
+                console.log('[DEBUG] Transmux Successful!');
                 const urlRes = await chrome.runtime.sendMessage({ action: 'createUrlFromIDB', blobKey: res.blobKey });
                 triggerDownload(urlRes.url, targetName, true);
                 setTimeout(() => chrome.runtime.sendMessage({ action: 'deleteBlob', key: res.blobKey }), 60000);
             } else {
-                console.error('[DEBUG] Transmux Returned Failure:', res?.error);
                 throw new Error("Transmux failed");
             }
         } catch (e) {
-            // Fallback to TS
-            console.warn("[DEBUG] Transmux failed/rejected. Saving raw.", e);
-            const fbRes = await chrome.runtime.sendMessage({
-                action: 'createFallbackUrl',
-                base64Chunks: base64Chunks,
-                mimeType: 'video/mp2t' // Raw TS
-            });
-            if (fbRes?.status === 'success') {
-                console.log('[DEBUG] Fallback URL Created. Downloading as .ts');
-                triggerDownload(fbRes.url, targetName.replace('.mp4', '.ts'), true);
-            }
+            console.error(e);
+            throw e; 
         }
 
     } catch (err) {
@@ -440,19 +419,14 @@ async function downloadHLS(video) {
         activeDownloads.delete(id);
     }
 }
-// --- UTILS ---
-const filenameOverrides = new Map();
 
-// Strict Filename Handler
+// Strictly monitor filenames
 chrome.downloads.onDeterminingFilename.addListener((item, suggest) => {
     if (filenameOverrides.has(item.url)) {
         const name = filenameOverrides.get(item.url);
-        console.log(`[DEBUG] Enforcing filename: ${name} for URL: ${item.url}`);
         suggest({ filename: name, conflictAction: 'uniquify' });
-        // Clean up memory after a short delay (or wait for download events, but this is simple)
         setTimeout(() => filenameOverrides.delete(item.url), 60000);
     }
-    // No return needed, async suggestion is handled by calling suggest.
 });
 
 function notifyProgress(url, percent, speed, status = 'Downloading') {
@@ -461,19 +435,13 @@ function notifyProgress(url, percent, speed, status = 'Downloading') {
 
 function triggerDownload(url, filename, isBlob) {
     console.log(`[DEBUG] triggerDownload called. URL: ${url}, Filename: ${filename}`);
-
-    // Register override for strict enforcement
     filenameOverrides.set(url, filename);
-
-    // Call download WITHOUT filename parameter to ensure onDeterminingFilename fires and takes full control
-    // taking no chances with conflicts
     chrome.downloads.download({ url: url, saveAs: false }, (dId) => {
         if (chrome.runtime.lastError) {
-            console.error("[DEBUG] Download failed to start:", chrome.runtime.lastError);
-            filenameOverrides.delete(url); // Clean up if failed
+             console.error("[DEBUG] Download failed to start:", chrome.runtime.lastError);
+             filenameOverrides.delete(url);
         } else {
-            console.log(`[DEBUG] Download started with ID: ${dId}`);
-            if (isBlob && dId) {
+             if (isBlob && dId) {
                 downloadBlobs.set(dId, url);
                 setTimeout(() => {
                     URL.revokeObjectURL(url);
@@ -507,5 +475,5 @@ class HLSParser {
         }
         return total > 0 ? total : 0;
     }
-    getVariants() { return []; } // Simplified for now
+    getVariants() { return []; } 
 }

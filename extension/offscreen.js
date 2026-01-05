@@ -67,7 +67,22 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
                 // CONFIGURATION: Force timestamp reset (Fixes 13h issue)
                 const transmuxer = new mux.mp4.Transmuxer({ keepOriginalTimeline: false });
 
-                let chunks = decodeChunks(message);
+                let chunks = [];
+                if (message.chunkKeys) {
+                     console.log(`[Transmux] Loading ${message.chunkKeys.length} chunks from IDB...`);
+                     for (const key of message.chunkKeys) {
+                         const blob = await getBlobFromIDB(key);
+                         if (blob) {
+                             chunks.push(await blob.arrayBuffer());
+                             // Optional: Clean up chunk immediately to save space? 
+                             // Maybe later.
+                             await deleteBlobFromIDB(key); // Auto-cleanup input chunks
+                         }
+                     }
+                } else {
+                     chunks = decodeChunks(message);
+                }
+                
                 console.log(`[Transmux] Starting: ${chunks.length} chunks`);
 
                 let initSegment = null;
@@ -185,6 +200,19 @@ function getBlobFromIDB(key) {
             const getReq = tx.objectStore('blobs').get(key);
             getReq.onsuccess = () => resolve(getReq.result);
             getReq.onerror = () => reject(getReq.error);
+        };
+        req.onerror = () => reject(req.error);
+    });
+}
+
+function deleteBlobFromIDB(key) {
+    return new Promise((resolve, reject) => {
+        const req = indexedDB.open('DownloadDB', 2);
+        req.onsuccess = (e) => {
+             const tx = e.target.result.transaction('blobs', 'readwrite');
+             tx.objectStore('blobs').delete(key);
+             tx.oncomplete = () => { e.target.result.close(); resolve(); };
+             tx.onerror = () => reject(tx.error);
         };
         req.onerror = () => reject(req.error);
     });
