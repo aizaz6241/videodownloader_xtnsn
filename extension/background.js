@@ -84,7 +84,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
             });
 
             // Enrich with Duration/Thumb
-            Promise.all(unique.map(enrichVideo)).then(final => sendResponse({ videos: final }));
+            Promise.all(unique.map(enrichVideo)).then(final => sendResponse({ videos: final.reverse() }));
         });
         return true;
     }
