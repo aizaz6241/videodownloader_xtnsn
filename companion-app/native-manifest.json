@@ -1,0 +1,9 @@
+{
+    "name": "com.streamsniffer.pro",
+    "description": "StreamSniffer Pro Native Host",
+    "path": "host.bat",
+    "type": "stdio",
+    "allowed_origins": [
+        "chrome-extension://<EXTENSION_ID>/"
+    ]
+}
