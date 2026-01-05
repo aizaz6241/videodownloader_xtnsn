@@ -1,12 +1,25 @@
 document.addEventListener('DOMContentLoaded', () => {
     const list = document.getElementById('video-list');
     const emptyState = document.getElementById('empty-state');
+    const tabs = document.querySelectorAll('.tab');
+    let currentTab = 'detected';
+    let allVideos = [];
+
+    // Tab Switching
+    tabs.forEach(tab => {
+        tab.addEventListener('click', () => {
+            tabs.forEach(t => t.classList.remove('active'));
+            tab.classList.add('active');
+            currentTab = tab.dataset.tab;
+            renderVideos(allVideos);
+        });
+    });
 
     // Request detected videos from Background script
     chrome.runtime.sendMessage({ action: 'GET_VIDEOS' }, (response) => {
-        if (response && response.videos && response.videos.length > 0) {
-            emptyState.style.display = 'none';
-            renderVideos(response.videos);
+        if (response && response.videos) {
+            allVideos = response.videos;
+            renderVideos(allVideos);
         } else {
             emptyState.style.display = 'block';
         }
@@ -73,7 +86,20 @@ document.addEventListener('DOMContentLoaded', () => {
 
     function renderVideos(videos) {
         list.innerHTML = '';
-        videos.forEach((video, index) => {
+
+        const filtered = videos.filter(v => {
+            if (currentTab === 'downloaded') return v.downloadState?.status === 'downloaded';
+            return v.downloadState?.status !== 'downloaded';
+        });
+
+        if (filtered.length === 0) {
+            emptyState.style.display = 'block';
+            emptyState.querySelector('p').textContent = currentTab === 'downloaded' ? 'No downloaded videos.' : 'No playable videos detected.';
+            return;
+        }
+        emptyState.style.display = 'none';
+
+        filtered.forEach((video, index) => {
             const li = document.createElement('div');
             li.className = 'video-item';
             li.setAttribute('data-url', video.url);
@@ -93,7 +119,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
             // Downloaded Status
             let statusHtml = '';
-            if (video.downloaded) {
+            if (video.downloadState?.status === 'downloaded') {
                 statusHtml = '<span class="status-tag" style="background:#40c057;color:white;padding:2px 6px;border-radius:4px;font-size:10px;margin-left:5px;">Downloaded</span>';
             }
 
@@ -303,6 +329,11 @@ document.addEventListener('DOMContentLoaded', () => {
 
 
             list.appendChild(li);
+
+            // AUTO-RESTORE PROGRESS
+            if (video.downloadState?.status === 'downloading') {
+                updateProgressUI(video.url, video.downloadState.percent, video.downloadState.speed, 'Downloading');
+            }
         });
     }
 });

@@ -333,8 +333,38 @@ footer {
     display: flex;
     align-items: center;
 }
+
 /* Fix Z-Index Stacking Context when dropdown is open */
 .video-item.z-active {
     z-index: 100;
     position: relative;
+}
+
+/* Tabs */
+.tabs {
+    display: flex;
+    background: #212529;
+    padding: 0 10px;
+    border-bottom: 1px solid #343a40;
+}
+
+.tab {
+    flex: 1;
+    text-align: center;
+    padding: 8px 0;
+    font-size: 13px;
+    color: #868e96;
+    cursor: pointer;
+    font-weight: 500;
+    transition: all 0.2s;
+    border-bottom: 2px solid transparent;
+}
+
+.tab:hover {
+    color: #e9ecef;
+}
+
+.tab.active {
+    color: #22b8cf;
+    border-bottom-color: #22b8cf;
 }

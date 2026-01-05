@@ -2,7 +2,7 @@ import { detectMediaType, extractMetadata, MediaTypes } from './mediaDetector.js
 
 // --- STATE MANAGEMENT ---
 const detectedMedia = new Map(); // tabId -> [Video]
-const activeDownloads = new Map(); // url -> { cancelled: boolean }
+const activeDownloads = new Map(); // url -> { cancelled: boolean, percent: number, speed: string }
 const completedDownloads = new Set(); // url
 const downloadBlobs = new Map(); // downloadId -> blobUrl
 const downloadOriginalUrls = new Map(); // downloadId -> originalUrl
@@ -86,6 +86,19 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
                     seenTitles.set(v.pageTitle, v.timestamp);
                 }
+
+                // --- INJECT PERSISTENT STATE ---
+                if (activeDownloads.has(v.url)) {
+                    const state = activeDownloads.get(v.url);
+                    v.downloadState = {
+                        status: 'downloading',
+                        percent: state.percent || 0,
+                        speed: state.speed || ''
+                    };
+                } else if (completedDownloads.has(v.url)) {
+                    v.downloadState = { status: 'downloaded' };
+                }
+
                 unique.push(v);
             });
 
@@ -98,7 +111,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     // B. Cancel/Download Control
     if (msg.action === 'CANCEL_DOWNLOAD') {
         if (activeDownloads.has(msg.url)) {
-            activeDownloads.get(msg.url).cancelled = true;
+            const entry = activeDownloads.get(msg.url);
+            entry.cancelled = true;
+            activeDownloads.set(msg.url, entry);
             sendResponse({ status: 'cancelled' });
         } else sendResponse({ status: 'not_found' });
         return true;
@@ -278,7 +293,7 @@ async function downloadHLS(video) {
     });
 
     const id = video.url;
-    activeDownloads.set(id, { cancelled: false });
+    activeDownloads.set(id, { cancelled: false, percent: 0, speed: '' });
     const tabId = video.tabId;
     safeUpdateBadge('...', tabId);
 
@@ -338,7 +353,7 @@ async function downloadHLS(video) {
         const startTime = Date.now();
 
         const downloadSegment = async (url, index) => {
-            if (activeDownloads.get(id).cancelled) throw new Error("Cancelled");
+            if (activeDownloads.get(id)?.cancelled) throw new Error("Cancelled");
             let res;
             try {
                 res = await fetch(url.startsWith('http') ? url : new URL(url, video.url).href, { referrer: video.pageUrl });
@@ -359,7 +374,7 @@ async function downloadHLS(video) {
 
         // Execution
         for (let i = 0; i < segments.length; i++) {
-            if (activeDownloads.get(id).cancelled) break;
+            if (activeDownloads.get(id)?.cancelled) break;
             try {
                 const size = await downloadSegment(segments[i], i);
                 totalBytes += size;
@@ -459,6 +474,13 @@ chrome.downloads.onDeterminingFilename.addListener((item, suggest) => {
 });
 
 function notifyProgress(url, percent, speed, status = 'Downloading') {
+    // Update State
+    if (activeDownloads.has(url)) {
+        const entry = activeDownloads.get(url);
+        entry.percent = percent;
+        entry.speed = speed;
+        activeDownloads.set(url, entry);
+    }
     chrome.runtime.sendMessage({ action: 'DOWNLOAD_PROGRESS', url, percent, speed, status }).catch(() => { });
 }
 
