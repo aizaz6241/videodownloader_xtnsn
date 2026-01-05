@@ -284,6 +284,7 @@ async function handleDownload(video) {
 async function downloadHLS(video) {
     console.log('[DEBUG] Fallback to JS HLS download...', video.url);
     const session = Math.random().toString(36).substring(7);
+    const originalUrl = video.url; // CAPTURE ORIGINAL URL BEFORE MUTATION
 
     chrome.notifications.create({
         type: 'basic',
@@ -444,7 +445,7 @@ async function downloadHLS(video) {
             if (res?.status === 'success') {
                 console.log('[DEBUG] Transmux Successful!');
                 const urlRes = await chrome.runtime.sendMessage({ action: 'createUrlFromIDB', blobKey: res.blobKey });
-                triggerDownload(urlRes.url, targetName, true, video.url);
+                triggerDownload(urlRes.url, targetName, true, originalUrl); // USE CAPTURED URL
                 setTimeout(() => chrome.runtime.sendMessage({ action: 'deleteBlob', key: res.blobKey }), 60000);
             } else {
                 throw new Error("Transmux failed");
@@ -542,6 +543,9 @@ chrome.downloads.onChanged.addListener((delta) => {
                 // Check if this was one of our blob downloads or tracked original
                 const originalUrl = downloadOriginalUrls.get(delta.id) || downloadBlobs.get(delta.id) || url;
                 completedDownloads.add(originalUrl);
+
+                // Notify Popup to Refresh
+                chrome.runtime.sendMessage({ action: 'DOWNLOAD_COMPLETE', url: originalUrl }).catch(() => { });
             }
         });
     }

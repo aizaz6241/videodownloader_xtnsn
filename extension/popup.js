@@ -47,6 +47,15 @@ document.addEventListener('DOMContentLoaded', () => {
         else if (message.action === 'DOWNLOAD_complete' || message.action === 'DOWNLOAD_error') {
             resetProgressUI(message.url);
         }
+        else if (message.action === 'DOWNLOAD_COMPLETE') {
+            // Refresh List logic
+            chrome.runtime.sendMessage({ action: 'GET_VIDEOS' }, (response) => {
+                if (response && response.videos) {
+                    allVideos = response.videos;
+                    renderVideos(allVideos);
+                }
+            });
+        }
     });
 
     function updateProgressUI(url, percent, speed, status) {
