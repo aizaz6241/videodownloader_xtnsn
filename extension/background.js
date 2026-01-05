@@ -240,6 +240,7 @@ async function handleDownload(video) {
 // --- HLS ENGINE (LEGACY JS FALLBACK) ---
 async function downloadHLS(video) {
     console.log('[DEBUG] Fallback to JS HLS download...', video.url);
+    const session = Math.random().toString(36).substring(7);
 
     chrome.notifications.create({
         type: 'basic',
@@ -357,7 +358,7 @@ async function downloadHLS(video) {
         
         const saveChunk = (chunk, idx) => {
              return new Promise((resolve, reject) => {
-                 const key = `chunk_${Date.now()}_${idx}`;
+                 const key = `chunk_${session}_${Date.now()}_${idx}`;
                  const req = indexedDB.open('DownloadDB', 2);
                  req.onupgradeneeded = (e) => {
                       const db = e.target.result;
